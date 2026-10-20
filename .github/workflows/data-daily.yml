@@ -87,4 +87,6 @@ jobs:
         env:
           JOB_REPORT_KEY: ${{ secrets.JOB_REPORT_KEY }}
           REPORT_URL: ${{ vars.REPORT_URL }}
-        run: node jobs/lib/report.mjs daily ${{ job.status }} "$LOG" > /dev/null 2>&1 || true
+        # Only the dashboard's answer is shown (200 = saved), never the report itself.
+        run: |
+          node jobs/lib/report.mjs daily ${{ job.status }} "$LOG" 2>/dev/null | grep -oE 'dashboard: [0-9]+|dashboard unreachable' || echo "report not sent"
