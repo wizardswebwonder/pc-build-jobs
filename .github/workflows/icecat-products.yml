@@ -1,0 +1,120 @@
+name: New products and photos (Icecat)
+
+# Runs the site's Icecat job on a schedule (see data-6h.yml for how the private
+# repository, secrets and quiet logs work).
+on:
+  schedule:
+    - cron: '0 1 * * *' # 06:30 IST
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Re-read the Icecat index even if the list is less than a day old'
+        type: boolean
+        default: false
+      max_imports:
+        description: 'Max new products this run'
+        default: '3500'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: data-commit
+  cancel-in-progress: false
+
+jobs:
+  icecat:
+    if: github.repository_owner == 'wizardswebwonder'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ secrets.SITE_REPO }}
+          token: ${{ secrets.SITE_TOKEN }}
+          # The token is not left in .git/config: only the save step uses it.
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '22'
+      - name: Mark the start
+        run: |
+          echo "LOG=$RUNNER_TEMP/job.log" >> "$GITHUB_ENV"
+          echo "JOB_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+          echo "START_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      # --ignore-scripts: no package's install script runs on this machine
+      # (the jobs only need cheerio and sharp, which work without them).
+      - name: Install
+        run: npm ci --ignore-scripts --no-audit --no-fund >> "$LOG" 2>&1 || { echo "failed"; exit 1; }; echo "done"
+      - name: Discover products
+        env:
+          ICECAT_PASSWORD: ${{ secrets.ICECAT_PASSWORD }}
+          FORCE: ${{ inputs.force && '--force' || '' }}
+        run: node jobs/icecat/discover.mjs $FORCE >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }; echo "done"
+      - name: What sells on eBay
+        continue-on-error: true
+        env:
+          EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
+          EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
+          EBAY_ENV: production
+        run: npm run job:ebay-discover >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }; echo "done"
+      - name: Import products and photos
+        env:
+          ICECAT_MAX_IMPORTS: ${{ inputs.max_imports || '3000' }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          JOB_REPORT_KEY: ${{ secrets.JOB_REPORT_KEY }}
+          REPORT_URL: ${{ vars.REPORT_URL }}
+        run: npm run job:icecat >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }; echo "done"
+      - name: Remove duplicates
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: npm run job:dedupe >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }; echo "done"
+      - name: Rebuild index
+        if: ${{ !cancelled() }}
+        run: npm run job:index >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }; echo "done"
+      - name: Sync to the database
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          JOB_REPORT_KEY: ${{ secrets.JOB_REPORT_KEY }}
+          REPORT_URL: ${{ vars.REPORT_URL }}
+        run: node jobs/catalog/d1-sync.mjs >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }; echo "done"
+      - name: Save the data
+        env:
+          SITE_TOKEN: ${{ secrets.SITE_TOKEN }}
+        if: ${{ !cancelled() }}
+        run: |
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$SITE_TOKEN" | base64 -w0)"
+          echo "::add-mask::$AUTH"
+          {
+            git config user.name "pickpc-bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add src/data
+            if git diff --cached --quiet; then
+              echo "No new products."
+            else
+              git commit -q -m "data: Icecat products and photos"
+              echo "RUN_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+              git -c http.extraheader="$AUTH" pull -q --rebase --autostash
+              git -c http.extraheader="$AUTH" push -q
+            fi
+          } >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }
+          echo "done"
+      - name: Report to the dashboard
+        if: always()
+        env:
+          JOB_REPORT_KEY: ${{ secrets.JOB_REPORT_KEY }}
+          REPORT_URL: ${{ vars.REPORT_URL }}
+        run: node jobs/lib/report.mjs icecat ${{ job.status }} "$LOG" > /dev/null 2>&1 || true

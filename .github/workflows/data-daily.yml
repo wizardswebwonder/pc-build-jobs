@@ -1,0 +1,90 @@
+name: Daily specs, prices and games
+
+# Runs the site's daily job on a schedule (see data-6h.yml for how the private
+# repository, secrets and quiet logs work).
+on:
+  schedule:
+    - cron: '23 2 * * *' # 07:53 IST
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: data-commit
+  cancel-in-progress: false
+
+jobs:
+  catalog:
+    if: github.repository_owner == 'wizardswebwonder'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ secrets.SITE_REPO }}
+          token: ${{ secrets.SITE_TOKEN }}
+          # The token is not left in .git/config: only the save step uses it.
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '22'
+      - name: Mark the start
+        run: |
+          echo "LOG=$RUNNER_TEMP/job.log" >> "$GITHUB_ENV"
+          echo "JOB_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+          echo "START_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      # --ignore-scripts: no package's install script runs on this machine
+      # (the jobs only need cheerio and sharp, which work without them).
+      - name: Install
+        run: npm ci --ignore-scripts --no-audit --no-fund >> "$LOG" 2>&1 || { echo "failed"; exit 1; }; echo "done"
+      - name: Specs
+        run: npm run job:specs >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }; echo "done"
+      - name: Official pages
+        run: npm run job:official-data >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }; echo "done"
+      - name: Exchange rates
+        run: node jobs/prices/fx.mjs >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }; echo "done"
+      - name: Price check
+        continue-on-error: true
+        run: npm run job:prices >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }; echo "done"
+      - name: Game requirements
+        run: npm run job:games >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }; echo "done"
+      - name: Rebuild index
+        run: npm run job:index >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }; echo "done"
+      - name: Sync to the database
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          JOB_REPORT_KEY: ${{ secrets.JOB_REPORT_KEY }}
+          REPORT_URL: ${{ vars.REPORT_URL }}
+        run: node jobs/catalog/d1-sync.mjs >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }; echo "done"
+      - name: Save the data
+        env:
+          SITE_TOKEN: ${{ secrets.SITE_TOKEN }}
+        run: |
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$SITE_TOKEN" | base64 -w0)"
+          echo "::add-mask::$AUTH"
+          {
+            git config user.name "pickpc-bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add src/data
+            if git diff --cached --quiet; then
+              echo "Nothing changed today."
+            else
+              git commit -q -m "data: daily specs, photos and games"
+              echo "RUN_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+              git -c http.extraheader="$AUTH" pull -q --rebase --autostash
+              git -c http.extraheader="$AUTH" push -q
+            fi
+          } >> "$LOG" 2>&1 || { echo "failed (details on the dashboard)"; exit 1; }
+          echo "done"
+      - name: Report to the dashboard
+        if: always()
+        env:
+          JOB_REPORT_KEY: ${{ secrets.JOB_REPORT_KEY }}
+          REPORT_URL: ${{ vars.REPORT_URL }}
+        run: node jobs/lib/report.mjs daily ${{ job.status }} "$LOG" > /dev/null 2>&1 || true
